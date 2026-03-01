@@ -1,0 +1,216 @@
+HOW MCP CONNECTION WORKS — FROM URL TO WORKING TOOLS
+=====================================================
+
+When a user pastes an MCP URL (like https://mcp.granola.ai/mcp) and hits
+connect, here's everything that happens and every edge case handled.
+
+
+STEP 0: WHAT IS AN MCP URL?
+----------------------------
+It's just an HTTP endpoint that speaks the Model Context Protocol.
+You POST JSON-RPC messages to it, it responds with tools, executes
+tool calls, etc. Think of it like a REST API but with a specific
+message format.
+
+Three transport types exist:
+  - HTTP (Streamable HTTP) — most common for remote/cloud MCPs
+  - SSE — older transport, same idea but uses Server-Sent Events
+  - Stdio — local MCPs, you spawn a process and talk over stdin/stdout
+
+Most cloud MCPs (Granola, Notion, Supabase, Exa) use HTTP.
+
+
+STEP 1: TRY TO CONNECT
+-----------------------
+Take the URL and open a Streamable HTTP connection using the MCP SDK:
+
+  const transport = new StreamableHTTPClientTransport(new URL(url));
+  const client = new Client({ name: "my-app", version: "1.0" });
+  await client.connect(transport);
+
+Three things can happen:
+
+  A) IT WORKS (no auth needed)
+     → Some MCPs are free/open (like Exa's free tier)
+     → Skip to Step 4
+
+  B) IT FAILS WITH AN AUTH ERROR (401, 403, "invalid_token")
+     → The MCP needs authentication
+     → Go to Step 2
+
+  C) IT FAILS WITH SOME OTHER ERROR
+     → Wrong URL, server down, etc.
+     → Show error to user
+
+
+STEP 2: FIGURE OUT WHAT AUTH THE MCP NEEDS
+-------------------------------------------
+Not all MCPs auth the same way. You need to discover what they want.
+
+METHOD A: Check the 401 response headers
+  When the MCP returns 401, look for:
+    www-authenticate: Bearer resource_metadata="https://example.com/.well-known/oauth-protected-resource/mcp"
+  If present, that URL tells you EXACTLY where the OAuth config is.
+  This is the most reliable method. Supabase does this.
+
+METHOD B: Check well-known URLs (try in order)
+  1. {origin}/.well-known/oauth-protected-resource{pathname}
+     e.g. https://mcp.supabase.com/.well-known/oauth-protected-resource/mcp
+     → Returns: { authorization_servers: ["https://api.supabase.com"] }
+     → Then fetch: https://api.supabase.com/.well-known/oauth-authorization-server
+     → Returns: { authorization_endpoint, token_endpoint, registration_endpoint }
+
+  2. {origin}/.well-known/oauth-protected-resource
+     (same as above but at root path — Granola uses this)
+
+  3. {origin}/.well-known/oauth-authorization-server
+     (some servers put auth config here directly)
+
+  4. {origin}/.well-known/openid-configuration
+     (OpenID Connect compatible servers)
+
+If ALL of these fail → the MCP either doesn't use OAuth or uses
+a non-standard auth method (API key in URL, API key in header, etc.)
+
+METHOD C: No OAuth — API key auth
+  Some MCPs (like Exa) take an API key as a URL query param:
+    https://mcp.exa.ai/mcp?exaApiKey=YOUR_KEY
+  Just paste the full URL with the key in it. No OAuth needed.
+
+  Others want a header:
+    Authorization: Bearer sk-xxx
+  User adds this as a custom header before connecting.
+
+
+STEP 3: DO THE OAUTH FLOW (if needed)
+--------------------------------------
+Once you have the OAuth config, the flow is:
+
+  A) REGISTER YOUR APP (dynamic client registration)
+     POST {registration_endpoint}
+     { client_name: "My App", redirect_uris: ["http://localhost:3000/callback"],
+       grant_types: ["authorization_code"], token_endpoint_auth_method: "none" }
+     → Response: { client_id: "..." }
+
+     Not all servers support this. If no registration_endpoint exists,
+     you may need a hardcoded client_id or it might just work without one.
+
+  B) GENERATE PKCE
+     code_verifier = random 32 bytes (base64url)
+     code_challenge = SHA256(code_verifier) (base64url)
+     Store code_verifier server-side. Never send it to the browser.
+
+  C) OPEN BROWSER POPUP
+     Redirect user to:
+       {authorization_endpoint}?response_type=code&client_id={id}
+         &redirect_uri={callback}&state={random}&code_challenge={challenge}
+         &code_challenge_method=S256
+
+     User logs into Granola/Notion/Supabase in the popup.
+     Provider redirects to your callback: {redirect_uri}?code=XXX&state=YYY
+
+  D) EXCHANGE CODE FOR TOKEN
+     POST {token_endpoint}
+     grant_type=authorization_code&code={code}&redirect_uri={callback}
+       &client_id={id}&code_verifier={verifier}
+
+     Response: { access_token: "...", refresh_token: "...", expires_in: 3600 }
+
+  E) STORE THE TOKEN
+     Save access_token, refresh_token, expiry, token_endpoint, client_id.
+     You'll need all of these for refresh later.
+
+
+STEP 4: CONNECT WITH THE TOKEN
+-------------------------------
+Now retry the connection with the token in the Authorization header:
+
+  const headers = { Authorization: `Bearer ${access_token}` };
+  const transport = new StreamableHTTPClientTransport(new URL(url), {
+    requestInit: { headers }
+  });
+  await client.connect(transport);
+
+This time it works. Now list the tools:
+
+  const { tools } = await client.listTools();
+  // Returns: [{ name: "list_meetings", description: "...", inputSchema: {...} }, ...]
+
+
+STEP 5: USE THE TOOLS
+----------------------
+When your LLM wants to call a tool:
+
+  const result = await client.callTool({
+    name: "list_meetings",
+    arguments: { time_range: "this_week" }
+  });
+  // The MCP SDK handles the HTTP request with the auth headers
+
+The token is attached to every request automatically because it was
+set on the transport when you created it.
+
+
+STEP 6: TOKEN REFRESH (ongoing)
+--------------------------------
+Access tokens expire (usually 15min to 6 hours). Before each use:
+
+  if (token is within 5 minutes of expiring) {
+    POST {token_endpoint}
+    grant_type=refresh_token&refresh_token={refresh_token}&client_id={client_id}
+    → New access_token + possibly new refresh_token
+  }
+
+If refresh fails → token is dead → user needs to re-authenticate (popup again).
+
+
+SUMMARY: WHAT TO BUILD
+-----------------------
+If you're building an app that connects to arbitrary MCPs, you need:
+
+  1. Connection manager
+     - Takes a URL, tries to connect
+     - Detects auth errors
+
+  2. OAuth discovery
+     - Parses www-authenticate header from 401
+     - Tries well-known URLs (with and without sub-path)
+     - Extracts: authorization_endpoint, token_endpoint, registration_endpoint
+
+  3. OAuth flow
+     - Dynamic client registration (if supported)
+     - PKCE generation
+     - Browser popup for user login
+     - Callback handler to receive code
+     - Token exchange (code → access_token + refresh_token)
+
+  4. Token storage
+     - In-memory for active sessions
+     - Database for persistence across restarts
+     - Keyed by MCP URL
+
+  5. Token refresh
+     - Check expiry before each use
+     - Refresh silently using refresh_token
+     - Fall back to re-auth if refresh fails
+
+  6. Two ways to use the token:
+     a) SELF-MANAGED: Attach to your own HTTP requests to the MCP.
+        You call tools yourself, feed results to the LLM.
+        Works with ANY LLM provider.
+
+     b) PASS-THROUGH: Send the token + MCP URL to the LLM provider.
+        They connect and call tools on their behalf.
+        Only works with Anthropic and OpenAI currently.
+        Anthropic: mcp_servers[].authorization_token
+        OpenAI: tools[].headers.Authorization
+
+
+AUTH PATTERNS SEEN IN THE WILD
+------------------------------
+  Granola:   OAuth, resource metadata at root path
+  Notion:    OAuth, 401 returns "invalid_token" in JSON body
+  Supabase:  OAuth, resource metadata at sub-path, www-authenticate header
+  Exa:       API key as URL query param (?exaApiKey=...)
+  Local MCPs: No auth, or env vars for stdio transport
+

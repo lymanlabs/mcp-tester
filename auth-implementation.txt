@@ -1,0 +1,263 @@
+MCP TESTER — AUTH IMPLEMENTATION SUMMARY
+=========================================
+
+OVERVIEW
+--------
+The app connects to remote MCP servers that use OAuth 2.0 browser-based
+authentication (e.g., Granola, Notion). The entire flow is handled server-side
+with a browser popup for the user login step. Once authenticated, tokens are
+persisted in SQLite and auto-refreshed.
+
+
+FILES INVOLVED
+--------------
+- src/lib/oauth.ts              — OAuth manager (singleton). Discovery, PKCE, client registration, token exchange, storage, refresh.
+- src/lib/db.ts                 — SQLite persistence. Stores connection configs and OAuth tokens across restarts.
+- src/app/api/mcp/oauth/start/route.ts    — Initiates OAuth flow, returns auth URL for browser popup.
+- src/app/api/mcp/oauth/callback/route.ts — Handles OAuth redirect, exchanges code for token, closes popup.
+- src/app/api/mcp/connect/route.ts        — Connects to MCP, detects auth errors, signals frontend to start OAuth.
+- src/lib/mcp-manager.ts        — Manages active MCP connections, attaches Bearer token to Streamable HTTP requests.
+
+
+AUTH FLOW (STEP BY STEP)
+------------------------
+
+1. CONNECT ATTEMPT WITHOUT TOKEN
+
+   When a user connects to an HTTP MCP (e.g. https://mcp.notion.com/mcp), the
+   connect route checks for a stored token:
+
+     let token = (await oauthManager.getToken(url)) || undefined;
+
+   getToken() checks in-memory first, then falls back to SQLite. If a token
+   exists but is within 5 minutes of expiring, it auto-refreshes using the
+   stored refresh token before returning.
+
+   If no token exists, connection is attempted without auth. The MCP server
+   rejects it (401, 403, or "invalid_token").
+
+
+2. AUTH ERROR DETECTION
+
+   The connect route catches the error and pattern-matches:
+
+     const isAuthError = transport === "http" && (
+       msg.includes("401") || msg.includes("unauthorized") ||
+       msg.includes("403") || msg.includes("invalid_token") ||
+       msg.includes("token") || msg.includes("auth") ||
+       msg.includes("forbidden") || !oauthManager.hasTokenSync(url)
+     );
+
+   Returns { error: "...", needsAuth: true } with status 401.
+
+
+3. FRONTEND STARTS OAUTH
+
+   Frontend sees needsAuth: true and calls POST /api/mcp/oauth/start with the MCP URL.
+
+
+4. OAUTH DISCOVERY
+
+   The OAuth manager discovers the server's OAuth configuration by trying
+   three well-known endpoints in order:
+
+     1. {origin}/.well-known/oauth-protected-resource
+        → follows authorization_servers[0]
+        → {authServer}/.well-known/oauth-authorization-server
+     2. {origin}/.well-known/oauth-authorization-server
+     3. {origin}/.well-known/openid-configuration
+
+   Returns: authorization_endpoint, token_endpoint, registration_endpoint (optional).
+
+
+5. DYNAMIC CLIENT REGISTRATION
+
+   If the server has a registration_endpoint, the app registers itself:
+
+     POST {registration_endpoint}
+     {
+       "client_name": "MCP Tester",
+       "redirect_uris": ["{origin}/api/mcp/oauth/callback"],
+       "grant_types": ["authorization_code"],
+       "response_types": ["code"],
+       "token_endpoint_auth_method": "none"
+     }
+
+   Server returns client_id (and optionally client_secret).
+
+
+6. PKCE GENERATION
+
+   - code_verifier: random 32 bytes, base64url encoded
+   - code_challenge: SHA-256 hash of verifier, base64url encoded
+   - state: random 16 bytes hex
+   - Verifier stored server-side in a Map keyed by state
+
+
+7. BROWSER POPUP
+
+   Frontend opens a popup to:
+
+     {authorization_endpoint}
+       ?response_type=code
+       &client_id={id}
+       &redirect_uri={callback}
+       &state={state}
+       &code_challenge={challenge}
+       &code_challenge_method=S256
+
+   User logs in on the MCP provider's page (Granola, Notion, etc.).
+
+
+8. CALLBACK & TOKEN EXCHANGE
+
+   Provider redirects to GET /api/mcp/oauth/callback?code=XXX&state=YYY
+
+   The callback route:
+   a) Looks up pending auth by state
+   b) Sends code + code_verifier to token endpoint:
+
+        POST {token_endpoint}
+        Content-Type: application/x-www-form-urlencoded
+
+        grant_type=authorization_code
+        &code={code}
+        &redirect_uri={callback}
+        &client_id={id}
+        &code_verifier={verifier}
+
+   c) Receives: access_token, refresh_token, expires_in
+   d) Stores in memory (Map keyed by MCP URL) with all refresh metadata
+   e) Returns HTML that messages the opener and auto-closes:
+
+        window.opener.postMessage({ type: "oauth_success" }, "*");
+        setTimeout(() => window.close(), 1500);
+
+
+9. AUTO-RETRY
+
+   Frontend receives oauth_success message, retries the connect.
+   This time getToken(url) returns the fresh token, which gets attached as:
+
+     Authorization: Bearer {token}
+
+   On the Streamable HTTP transport headers.
+
+
+10. PERSISTENCE
+
+    After successful connection, if the connection has a DB connectionId,
+    the token is persisted to SQLite:
+
+      oauthManager.persistToDb(connectionId, url);
+
+    Writes: access_token, refresh_token, token_expires_at, token_endpoint,
+    client_id, client_secret to the connections table.
+
+
+TOKEN REFRESH
+-------------
+getToken() is async and checks expiry before returning:
+
+  - If token is within 5 minutes of expiring → refresh silently
+  - Refresh uses stored token_endpoint, client_id, and refresh_token:
+
+      POST {token_endpoint}
+      grant_type=refresh_token&refresh_token={token}&client_id={id}
+
+  - Retries once on failure
+  - If both attempts fail → token deleted → next connect triggers full OAuth popup
+
+
+TOKEN LIFECYCLE
+---------------
+
+  First connect
+    → 401
+    → OAuth discovery
+    → PKCE + popup
+    → user login
+    → code exchange
+    → token stored (memory + SQLite)
+
+  Subsequent connects
+    → getToken()
+    → check expiry
+    → if fresh: use it
+    → if near expiry: refresh silently
+    → if refresh fails: re-auth via popup
+
+  Server restart
+    → getToken() checks in-memory (empty)
+    → falls back to SQLite
+    → loads token
+    → continues normally
+
+
+AUTH METHODS SUPPORTED (BY MCP TYPE)
+------------------------------------
+
+  OAuth (HTTP transport):
+    - Full browser popup flow as described above
+    - Used by: Granola, Notion, and any MCP with OAuth 2.0
+
+  Static API key as query param:
+    - User pastes full URL with key: https://mcp.exa.ai/mcp?exaApiKey=XXX
+    - Passed through as-is to StreamableHTTPClientTransport
+    - No special handling needed
+
+  Static API key as header:
+    - User adds via "Custom headers" section in the UI
+    - e.g., Authorization: Bearer sk-xxx
+    - Passed through in requestInit.headers on the transport
+
+  Environment variables (stdio transport):
+    - User adds via "Environment variables" section
+    - Merged with process.env and passed to StdioClientTransport
+    - Used by local MCP servers that read keys from env
+
+  No auth:
+    - Local MCPs on localhost, or free-tier services
+    - Just connect directly, no tokens or headers needed
+
+
+KEY DESIGN DECISIONS
+--------------------
+- PKCE only, no client secrets required — works with any OAuth provider
+  that supports public clients
+- Dynamic client registration — no hardcoded client IDs; app registers
+  itself on first use with each provider
+- Token storage is per-URL — if two saved connections point to the same
+  MCP URL, they share the token
+- 5-minute refresh buffer with single retry — proactively refreshes
+  before expiry
+- SQLite persistence — tokens survive server restarts without re-auth
+- Browser popup pattern — user stays on the app page; login happens in
+  a popup that auto-closes
+- Multi-MCP support — multiple connections can be active simultaneously;
+  tool calls are routed to the correct MCP based on which one owns the tool
+
+
+DATABASE SCHEMA
+---------------
+
+  CREATE TABLE connections (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    transport TEXT NOT NULL,        -- "sse" | "stdio" | "http"
+    url TEXT,
+    command TEXT,
+    args TEXT,                      -- JSON array
+    headers TEXT,                   -- JSON object
+    env_vars TEXT,                  -- JSON object
+    access_token TEXT,
+    refresh_token TEXT,
+    token_expires_at INTEGER,       -- Unix ms timestamp
+    token_endpoint TEXT,            -- For refresh calls
+    client_id TEXT,                 -- From dynamic registration
+    client_secret TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  )
+
+

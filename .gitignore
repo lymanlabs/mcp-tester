@@ -1,0 +1,11 @@
+node_modules/
+.next/
+.env.local
+.env
+mcp-tester.db
+mcp-tester.db-wal
+mcp-tester.db-shm
+*.db
+*.db-wal
+*.db-shm
+

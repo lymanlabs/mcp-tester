@@ -1,0 +1,480 @@
+OAUTH FLOW — COMPLETE CODE WALKTHROUGH
+========================================
+
+This walks through every file involved, in the order they execute,
+with the actual code paths traced. Use this to understand or replicate
+the OAuth implementation.
+
+
+========================================
+TRIGGER: User toggles on a saved MCP connection (e.g. Granola)
+========================================
+
+File: src/app/page.tsx
+Function: toggleConn()
+
+  1. Frontend calls POST /api/mcp/connect with:
+     { connectionId: "abc", name: "Granola", transport: "http", url: "https://mcp.granola.ai/mcp" }
+
+
+========================================
+STEP 1: Connect route checks for existing token
+========================================
+
+File: src/app/api/mcp/connect/route.ts
+
+  // Line 17-20: Check if we already have a token for this URL
+  let token: string | undefined;
+  if (transport === "http" && url) {
+    token = (await oauthManager.getToken(url)) || undefined;
+  }
+
+  This calls into the OAuth manager...
+
+
+File: src/lib/oauth.ts
+Function: getToken(mcpUrl)
+
+  // First checks in-memory Map
+  if (!this.tokens.has(mcpUrl)) this.loadFromDb(mcpUrl);
+  //   ↑ If not in memory, tries to load from SQLite
+
+  // loadFromDb() calls getTokenForUrl() in db.ts which runs:
+  //   SELECT access_token, refresh_token, token_expires_at, token_endpoint, client_id
+  //   FROM connections WHERE url = ? AND access_token IS NOT NULL
+
+  // If token found but near expiry (within 5 minutes):
+  const almostExpired = tok.expiresAt && (Date.now() > tok.expiresAt - 5 * 60_000);
+  if (almostExpired) {
+    let refreshed = await this.refreshAccessToken(tok);
+    if (!refreshed) refreshed = await this.refreshAccessToken(tok); // retry once
+    // refreshAccessToken() does:
+    //   POST {tok.tokenEndpoint}
+    //   grant_type=refresh_token&refresh_token={tok.refreshToken}&client_id={tok.clientId}
+    // Updates tok.accessToken and tok.expiresAt in place if successful
+  }
+
+  return tok.accessToken;  // or null if no token / refresh failed
+
+
+========================================
+STEP 2: Connection attempt (with or without token)
+========================================
+
+File: src/app/api/mcp/connect/route.ts → src/lib/mcp-manager.ts
+Function: mcpManager.connect()
+
+  // If we got a token, it's attached to the HTTP headers:
+  if (config.token) h["Authorization"] = `Bearer ${config.token}`;
+  transport = new StreamableHTTPClientTransport(new URL(config.url), { requestInit: { headers: h } });
+  await client.connect(transport);
+
+  // If no token exists → connection attempt fails
+  // MCP server returns 401, "invalid_token", "Unauthorized", etc.
+
+
+========================================
+STEP 3: Auth error detection
+========================================
+
+File: src/app/api/mcp/connect/route.ts (catch block)
+
+  // Pattern-match common auth error formats from different MCP servers:
+  //   Granola returns: 401 Unauthorized
+  //   Notion returns:  {"error":"invalid_token","error_description":"Missing or invalid access token"}
+  //   Others may return: 403, "forbidden", etc.
+
+  const isAuthError = transport === "http" && (
+    msg.includes("401") || msg.includes("unauthorized") || msg.includes("403") ||
+    msg.includes("invalid_token") || msg.includes("token") || msg.includes("auth") ||
+    msg.includes("forbidden") || !oauthManager.hasTokenSync(url || "")
+  );
+
+  // If auth error detected, tell the frontend:
+  if (isAuthError) {
+    return NextResponse.json({ error: error.message, needsAuth: true }, { status: 401 });
+    //                                                 ^^^^^^^^^^^^
+    //                                     This flag is what triggers the OAuth flow
+  }
+
+
+========================================
+STEP 4: Frontend receives needsAuth, starts OAuth
+========================================
+
+File: src/app/page.tsx
+Function: toggleConn() → startOAuth()
+
+  // In toggleConn:
+  const d = await r.json();
+  if (!r.ok) {
+    if (d.needsAuth && t === "http" && c.url) {
+      startOAuth(c.url);  // ← triggers OAuth flow
+      return;
+    }
+    throw new Error(d.error);
+  }
+
+  // startOAuth() does:
+  const startOAuth = async (mcpUrl: string) => {
+    setOauthStatus("pending");  // Shows "Waiting for login…" in UI
+    setOauthUrl(mcpUrl);        // Remember which URL we're authing for
+
+    // Call the backend to set up the OAuth flow
+    const d = await fetch("/api/mcp/oauth/start", {
+      method: "POST",
+      body: JSON.stringify({ mcpUrl })
+    }).then(r => r.json());
+
+    // Open browser popup to the auth URL
+    window.open(d.authUrl, "mcp_oauth", "width=500,height=650,...");
+  };
+
+
+========================================
+STEP 5: Backend discovers OAuth config & sets up PKCE
+========================================
+
+File: src/app/api/mcp/oauth/start/route.ts
+
+  export async function POST(req: Request) {
+    const { mcpUrl } = await req.json();
+
+    // Build callback URL from the current request origin
+    // e.g. http://localhost:3000/api/mcp/oauth/callback
+    const origin = new URL(req.url).origin;
+    const callbackUrl = `${origin}/api/mcp/oauth/callback`;
+
+    // This does ALL the OAuth setup:
+    const { authUrl, state } = await oauthManager.startFlow(mcpUrl, callbackUrl);
+
+    return NextResponse.json({ authUrl, state });
+  }
+
+
+File: src/lib/oauth.ts
+Function: startFlow(mcpUrl, callbackUrl)
+
+  // ── A. DISCOVERY ──
+  // Try to find the OAuth server's configuration.
+  // Attempts three well-known URLs in order:
+
+  async discoverMetadata(mcpUrl: string) {
+    const origin = new URL(mcpUrl).origin;
+    // e.g. for Granola: origin = "https://mcp.granola.ai"
+
+    // Try 1: MCP-spec protected resource metadata
+    //   GET https://mcp.granola.ai/.well-known/oauth-protected-resource
+    //   Response includes: { authorization_servers: ["https://mcp-auth.granola.ai"] }
+    //   Then fetch: GET https://mcp-auth.granola.ai/.well-known/oauth-authorization-server
+    //   Response includes: { authorization_endpoint, token_endpoint, registration_endpoint }
+
+    // Try 2: Direct well-known on the origin
+    //   GET https://mcp.granola.ai/.well-known/oauth-authorization-server
+
+    // Try 3: OpenID configuration
+    //   GET https://mcp.granola.ai/.well-known/openid-configuration
+
+    // Returns: { authorization_endpoint, token_endpoint, registration_endpoint }
+  }
+
+  // ── B. DYNAMIC CLIENT REGISTRATION ──
+  // Our app doesn't have pre-registered credentials with Granola/Notion.
+  // So we register ourselves on the fly.
+
+  if (metadata.registration_endpoint) {
+    const res = await fetch(metadata.registration_endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        client_name: "MCP Tester",
+        redirect_uris: [callbackUrl],   // e.g. http://localhost:3000/api/mcp/oauth/callback
+        grant_types: ["authorization_code"],
+        response_types: ["code"],
+        token_endpoint_auth_method: "none",  // Public client, no secret needed
+      }),
+    });
+    // Response: { client_id: "client_01KH773..." }
+    clientId = data.client_id;
+  }
+
+  // ── C. PKCE (Proof Key for Code Exchange) ──
+  // Prevents anyone who intercepts the auth URL from completing the flow.
+
+  const verifier = crypto.randomBytes(32).toString("base64url");
+  // e.g. "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+
+  const challenge = crypto.createHash("sha256").update(verifier).digest("base64url");
+  // e.g. "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+
+  const state = crypto.randomBytes(16).toString("hex");
+  // e.g. "a3f5b2c1d4e6f7890123456789abcdef"
+
+  // ── D. STORE STATE SERVER-SIDE ──
+  // We need the verifier later (in the callback) to prove we started this flow.
+  this.pending.set(state, {
+    codeVerifier: verifier,   // Secret — never sent to the browser
+    state,
+    clientId,
+    redirectUri: callbackUrl,
+    tokenEndpoint: metadata.token_endpoint,
+    mcpUrl,
+  });
+
+  // ── E. BUILD AUTH URL ──
+  // This is what the browser popup will open.
+  const params = new URLSearchParams({
+    response_type: "code",
+    client_id: clientId,
+    redirect_uri: callbackUrl,
+    state: state,
+    code_challenge: challenge,        // Hash of verifier (public)
+    code_challenge_method: "S256",
+  });
+
+  return {
+    authUrl: `${metadata.authorization_endpoint}?${params}`,
+    // e.g. "https://mcp-auth.granola.ai/oauth2/authorize?response_type=code&client_id=...&..."
+  };
+
+
+========================================
+STEP 6: User logs in via browser popup
+========================================
+
+The popup opens to something like:
+  https://mcp-auth.granola.ai/oauth2/authorize?response_type=code&client_id=client_01KH773...&redirect_uri=http://localhost:3000/api/mcp/oauth/callback&state=a3f5b2c1...&code_challenge=E9Melh...&code_challenge_method=S256
+
+The user sees Granola's login page. They sign in with their Granola account.
+Granola verifies the user, then redirects the popup to:
+
+  http://localhost:3000/api/mcp/oauth/callback?code=AUTHORIZATION_CODE_HERE&state=a3f5b2c1...
+
+
+========================================
+STEP 7: Callback receives code, exchanges for token
+========================================
+
+File: src/app/api/mcp/oauth/callback/route.ts
+
+  export async function GET(req: Request) {
+    const code = searchParams.get("code");    // One-time authorization code
+    const state = searchParams.get("state");  // Must match what we stored
+
+    // Exchange code for token
+    await oauthManager.exchangeCode(state, code);
+
+    // Return HTML that tells the parent window and closes itself
+    // <script>
+    //   window.opener.postMessage({ type: "oauth_success" }, "*");
+    //   setTimeout(() => window.close(), 1500);
+    // </script>
+  }
+
+
+File: src/lib/oauth.ts
+Function: exchangeCode(state, code)
+
+  // Look up the pending auth by state
+  const pending = this.pending.get(state);
+  // This gives us back: codeVerifier, clientId, redirectUri, tokenEndpoint, mcpUrl
+
+  // ── TOKEN EXCHANGE ──
+  // Send the authorization code + our PKCE verifier to get tokens.
+  // The server checks: SHA256(verifier) === the challenge we sent in Step 5.
+  // This proves we're the same app that started the flow.
+
+  const res = await fetch(pending.tokenEndpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      code: code,                        // One-time code from the redirect
+      redirect_uri: pending.redirectUri,  // Must match what we registered
+      client_id: pending.clientId,
+      code_verifier: pending.codeVerifier, // PKCE proof
+    }).toString(),
+  });
+
+  // Response from Granola:
+  // {
+  //   "access_token": "eyJhbGciOiJSUzI1NiI...",   ← This is what we need
+  //   "refresh_token": "oUKBdRg1UlnM7nOXteu...",   ← For getting new access tokens later
+  //   "expires_in": 21600,                           ← Seconds until access_token expires (6 hours)
+  //   "token_type": "Bearer"
+  // }
+
+  // ── STORE TOKEN ──
+  // Stored in memory (Map keyed by MCP URL) with all metadata needed for refresh
+  this.tokens.set(pending.mcpUrl, {
+    accessToken: data.access_token,
+    refreshToken: data.refresh_token,
+    expiresAt: Date.now() + data.expires_in * 1000,
+    tokenEndpoint: pending.tokenEndpoint,   // Needed later for refresh
+    clientId: pending.clientId,             // Needed later for refresh
+  });
+
+  // Clean up — this state can't be reused
+  this.pending.delete(state);
+
+
+========================================
+STEP 8: Frontend receives success, retries connection
+========================================
+
+File: src/app/page.tsx
+
+  // The popup ran: window.opener.postMessage({ type: "oauth_success" }, "*");
+  // Our message listener catches it:
+
+  useEffect(() => {
+    const h = (e: MessageEvent) => {
+      if (e.data?.type === "oauth_success") setOauthStatus("done");
+    };
+    window.addEventListener("message", h);
+    return () => window.removeEventListener("message", h);
+  }, []);
+
+  // When oauthStatus becomes "done", auto-retry:
+  useEffect(() => {
+    if (oauthStatus !== "done") return;
+    setOauthStatus("idle");
+    const c = saved.find(s => s.url === oauthUrl);
+    if (c) toggleConn(c);  // ← Retry the toggle that originally failed
+  }, [oauthStatus]);
+
+
+========================================
+STEP 9: Second connect attempt — now with token
+========================================
+
+File: src/app/api/mcp/connect/route.ts
+
+  // Same code as Step 1, but this time getToken() finds the token in memory:
+  let token = (await oauthManager.getToken(url)) || undefined;
+  // token = "eyJhbGciOiJSUzI1NiI..."
+
+  // Passed to mcp-manager:
+  mcpManager.connect(connectionId, name, { transport: "http", url, token });
+
+
+File: src/lib/mcp-manager.ts
+
+  // Token attached to request headers:
+  if (config.token) h["Authorization"] = `Bearer ${config.token}`;
+  transport = new StreamableHTTPClientTransport(new URL(config.url), { requestInit: { headers: h } });
+  await client.connect(transport);
+  // ✅ Connection succeeds — Granola accepts the token
+
+  // List tools
+  const r = await client.listTools();
+  // Returns: [query_granola_meetings, list_meetings, get_meetings, get_meeting_transcript]
+
+
+========================================
+STEP 10: Persist token to SQLite
+========================================
+
+File: src/app/api/mcp/connect/route.ts
+
+  // After successful connection, save token to DB so it survives server restarts
+  if (transport === "http" && url) {
+    oauthManager.persistToDb(connectionId, url);
+  }
+
+
+File: src/lib/oauth.ts → src/lib/db.ts
+
+  // persistToDb reads from the in-memory token store and writes to SQLite:
+  //   UPDATE connections SET
+  //     access_token = ?, refresh_token = ?, token_expires_at = ?,
+  //     token_endpoint = ?, client_id = ?, client_secret = ?
+  //   WHERE id = ?
+
+
+========================================
+LATER: How the token gets USED in chat
+========================================
+
+File: src/app/api/chat/route.ts
+
+  // When the user sends a message, the chat route calls:
+  const result = await mcpManager.callTool("list_meetings", { time_range: "this_week" });
+
+  // mcpManager.callTool() uses the already-connected MCP client.
+  // The client was created with the Bearer token in its headers (Step 9).
+  // So every tool call automatically includes the token.
+  // The token is NOT sent to Claude/OpenAI — only to the MCP server.
+
+
+========================================
+LATER: Token refresh (automatic, invisible)
+========================================
+
+File: src/lib/oauth.ts
+Function: getToken() — called before every connection attempt
+
+  // If token expires in less than 5 minutes:
+  const almostExpired = tok.expiresAt && (Date.now() > tok.expiresAt - 5 * 60_000);
+  if (almostExpired) {
+    // Silently refresh — no user interaction needed
+    const res = await fetch(tok.tokenEndpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: tok.refreshToken,
+        client_id: tok.clientId,
+      }).toString(),
+    });
+    // Response: { access_token: "NEW_TOKEN", refresh_token: "NEW_REFRESH", expires_in: 21600 }
+    // Token updated in-memory. Next persist writes it to DB.
+  }
+
+
+========================================
+SUMMARY: Where each piece lives
+========================================
+
+  Frontend (page.tsx):
+    - Opens popup for user login
+    - Listens for oauth_success message
+    - Retries connection after auth
+
+  /api/mcp/oauth/start (start/route.ts):
+    - Discovers OAuth endpoints
+    - Registers as OAuth client
+    - Generates PKCE
+    - Returns auth URL for popup
+
+  /api/mcp/oauth/callback (callback/route.ts):
+    - Receives authorization code from provider redirect
+    - Exchanges code for access_token + refresh_token
+    - Closes popup
+
+  OAuth manager (oauth.ts):
+    - In-memory token store (Map<mcpUrl, token>)
+    - PKCE generation
+    - OAuth discovery (3 well-known URLs)
+    - Dynamic client registration
+    - Token exchange
+    - Token refresh (automatic, 5-min buffer, 1 retry)
+    - Load from / persist to SQLite
+
+  DB (db.ts):
+    - SQLite table with token columns
+    - Tokens survive server restarts
+
+  MCP manager (mcp-manager.ts):
+    - Attaches Bearer token to HTTP headers
+    - Uses token when calling MCP tools
+
+  Connect route (connect/route.ts):
+    - Checks for token before connecting
+    - Detects auth errors (401, invalid_token, etc.)
+    - Returns { needsAuth: true } to trigger OAuth
+
+  Chat route (chat/route.ts):
+    - Never touches OAuth directly
+    - Just calls mcpManager.callTool() which uses the already-authed connection
+
