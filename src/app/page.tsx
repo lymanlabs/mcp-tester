@@ -16,7 +16,7 @@ type Transport = "sse" | "stdio" | "http";
 interface SavedConn { id: string; name: string; transport: Transport; url: string | null; command: string | null; args: string[]; headers: Record<string, string>; env_vars: Record<string, string>; hasToken: boolean; tokenExpiresIn: number | null; hasRefresh: boolean }
 
 const MODELS: Record<Provider, string[]> = {
-  claude: ["claude-sonnet-4-20250514", "claude-3-5-haiku-20241022", "claude-3-5-sonnet-20241022"],
+  claude: ["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001", "claude-sonnet-4-5-20250929", "claude-sonnet-4-20250514"],
   openai: ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "o3-mini"],
 };
 
@@ -461,10 +461,13 @@ export default function Home() {
         {/* ═══ RIGHT ═══ */}
         <aside className="w-[264px] flex-shrink-0 border-l border-[var(--border)] flex flex-col">
           <div className="flex-1 overflow-y-auto px-4 py-6 space-y-3">
-            <label className="text-[11px] font-bold uppercase tracking-[0.08em] text-[var(--text-muted)]">
-              Connections{saved.length > 0 ? ` (${saved.length})` : ""}
-            </label>
-            {saved.length === 0 && <p className="text-[13px] text-[var(--text-muted)] leading-relaxed">Save a connection from the left panel to see it here.</p>}
+            <div className="flex items-center justify-between">
+              <label className="text-[11px] font-bold uppercase tracking-[0.08em] text-[var(--text-muted)]">
+                Connections{saved.length > 0 ? ` (${saved.length})` : ""}
+              </label>
+              <a href="/discover" className="text-[11px] font-semibold text-[var(--blue)] hover:underline">Discover MCPs →</a>
+            </div>
+            {saved.length === 0 && <p className="text-[13px] text-[var(--text-muted)] leading-relaxed">Save a connection from the left panel or <a href="/discover" className="text-[var(--blue)] hover:underline">discover MCPs</a>.</p>}
             {saved.map(c => {
               const isOn = activeIds.has(c.id);
               const isLoading = togglingId === c.id;
